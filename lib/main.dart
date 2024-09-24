@@ -1,115 +1,119 @@
-import 'dart:convert';
-import 'dart:io';
-import 'dart:typed_data';
-
-import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
-import 'package:path/path.dart' as path;
-import 'package:path_provider/path_provider.dart';
+import 'package:camera/camera.dart';
+import 'dart:async';
 
 List<CameraDescription> cameras = [];
 
-void main() async {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // Obtain a list of the available cameras on the device.
   cameras = await availableCameras();
-  runApp(PhoneApp());
+
+  // Get the first camera from the list.
+  final firstCamera = cameras.first;
+
+  runApp(MyApp(camera: firstCamera));
 }
 
-class PhoneApp extends StatefulWidget {
+class MyApp extends StatelessWidget {
+  final CameraDescription camera;
+
+  const MyApp({Key? key, required this.camera}) : super(key: key);
+
   @override
-  _PhoneAppState createState() => _PhoneAppState();
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      theme: ThemeData.dark(),
+      home: CameraPage(camera: camera),
+    );
+  }
 }
 
-class _PhoneAppState extends State<PhoneApp> {
-  WebSocket? _socket;
-  String _status = 'Disconnected';
-  TextEditingController _controller = TextEditingController();
-  bool _isConnecting = false;
+class CameraPage extends StatefulWidget {
+  final CameraDescription camera;
 
-  late CameraController _cameraController;
-  bool _isCameraInitialized = false;
+  const CameraPage({Key? key, required this.camera}) : super(key: key);
+
+  @override
+  _CameraPageState createState() => _CameraPageState();
+}
+
+class _CameraPageState extends State<CameraPage> {
+  late CameraController _controller;
+  Future<void>? _initializeControllerFuture;
+  bool _isProcessing = false;
+  Timer? _timer;
+  bool _blackDetected = false;
 
   @override
   void initState() {
     super.initState();
-    if (cameras.isNotEmpty) {
-      _cameraController =
-          CameraController(cameras[0], ResolutionPreset.medium);
-      _initializeCamera();
-    } else {
-      print('No cameras available');
-    }
-  }
+    // Initialize the camera controller.
+    _controller = CameraController(
+      widget.camera,
+      ResolutionPreset.medium,
+      enableAudio: false,
+    );
 
-  void _initializeCamera() async {
-    try {
-      await _cameraController.initialize();
-      setState(() {
-        _isCameraInitialized = true;
-      });
-    } catch (e) {
-      print('Error initializing camera: $e');
-    }
-  }
-
-  void connectToWebSocket(String serverAddress) async {
-    setState(() {
-      _isConnecting = true;
+    // Initialize the controller and start image streaming.
+    _initializeControllerFuture = _controller.initialize().then((_) {
+      if (!mounted) return;
+      _controller.startImageStream(_processCameraImage);
     });
+  }
+
+  void _processCameraImage(CameraImage image) async {
+    if (_isProcessing) return;
+    _isProcessing = true;
 
     try {
-      _socket = await WebSocket.connect(serverAddress);
-      setState(() {
-        _status = 'Connected to server';
-        _isConnecting = false;
-      });
-      _socket!.listen((message) {
-        handleMessage(message);
-      }, onDone: () {
-        setState(() {
-          _status = 'Disconnected';
+      // Calculate the average brightness of the image.
+      final brightness = _calculateBrightness(image);
+      print('Average Brightness: $brightness');
+
+      // If brightness is below the threshold, start the timer.
+      if (brightness < 30 && !_blackDetected) {
+        _blackDetected = true;
+        _timer = Timer(Duration(seconds: 3), () {
+          _takePicture();
         });
-      });
-    } catch (e) {
-      print('Error connecting to server: $e');
-      setState(() {
-        _status = 'Error connecting to server';
-        _isConnecting = false;
-      });
+      } else if (brightness >= 30 && _blackDetected) {
+        // Cancel the timer if brightness increases.
+        _blackDetected = false;
+        _timer?.cancel();
+      }
+    } finally {
+      _isProcessing = false;
     }
   }
 
-  void handleMessage(String message) async {
-    Map<String, dynamic> data = jsonDecode(message);
-    if (data['command'] == 'take_picture') {
-      await takePictureAndSend();
+  double _calculateBrightness(CameraImage image) {
+    // Assuming YUV420 format and using the Y plane for luminance.
+    final plane = image.planes[0];
+    final bytes = plane.bytes;
+    int totalLuminance = 0;
+
+    // Sample pixels to reduce computation.
+    int sampleRate = 100;
+    for (int i = 0; i < bytes.length; i += sampleRate) {
+      totalLuminance += bytes[i];
     }
+
+    return totalLuminance / (bytes.length / sampleRate);
   }
 
-  Future<void> takePictureAndSend() async {
+  Future<void> _takePicture() async {
     try {
-      if (!_cameraController.value.isInitialized) {
-        print('Camera not initialized');
-        return;
-      }
+      await _initializeControllerFuture;
 
-      // Ensure the camera is not taking a picture already
-      if (_cameraController.value.isTakingPicture) {
-        print('Camera is already taking a picture');
-        return;
-      }
+      final image = await _controller.takePicture();
 
-      final Directory extDir = await getTemporaryDirectory();
-      final String dirPath = '${extDir.path}/Pictures/flutter_test';
-      await Directory(dirPath).create(recursive: true);
-      final String filePath =
-          '$dirPath/${DateTime.now().millisecondsSinceEpoch.toString()}.jpg';
+      // Handle the captured image (e.g., save or display).
+      print('Picture taken: ${image.path}');
 
-      XFile picture = await _cameraController.takePicture();
-
-      Uint8List imageBytes = await picture.readAsBytes();
-      String base64Image = base64Encode(imageBytes);
-      _socket?.add(jsonEncode({'image': base64Image}));
+      // Reset the detection flag.
+      _blackDetected = false;
     } catch (e) {
       print('Error taking picture: $e');
     }
@@ -117,65 +121,24 @@ class _PhoneAppState extends State<PhoneApp> {
 
   @override
   void dispose() {
-    _cameraController.dispose();
-    _socket?.close();
+    _controller.dispose();
+    _timer?.cancel();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'Phone App',
-      home: Scaffold(
-        appBar: AppBar(
-          title: Text('Phone App'),
-        ),
-        body: Center(
-          child: _status == 'Disconnected' ||
-                  _status == 'Error connecting to server'
-              ? Padding(
-                  padding: const EdgeInsets.all(16.0),
-                  child: ListView(
-                    shrinkWrap: true,
-                    children: [
-                      Text('Enter server address (e.g., ws://192.168.x.x:4040)'),
-                      TextField(
-                        controller: _controller,
-                        decoration: InputDecoration(
-                          hintText: 'ws://192.168.x.x:4040',
-                        ),
-                      ),
-                      SizedBox(height: 10),
-                      ElevatedButton(
-                        onPressed: _isConnecting
-                            ? null
-                            : () {
-                                connectToWebSocket(_controller.text);
-                              },
-                        child: Text('Connect'),
-                      ),
-                      SizedBox(height: 20),
-                      Text(_status),
-                    ],
-                  ),
-                )
-              : Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Text('Connected to server'),
-                    SizedBox(height: 10),
-                    _isCameraInitialized
-                        ? AspectRatio(
-                            aspectRatio:
-                                _cameraController.value.aspectRatio,
-                            child: CameraPreview(_cameraController),
-                          )
-                        : CircularProgressIndicator(),
-                    SizedBox(height: 10),
-                    Text('Waiting for commands...'),
-                  ],
-                ),
-        ),
+    return Scaffold(
+      // Display the camera preview.
+      body: FutureBuilder<void>(
+        future: _initializeControllerFuture,
+        builder: (context, snapshot) {
+          if (snapshot.connectionState == ConnectionState.done) {
+            return CameraPreview(_controller);
+          } else {
+            return Center(child: CircularProgressIndicator());
+          }
+        },
       ),
     );
   }
